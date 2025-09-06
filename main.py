@@ -319,9 +319,12 @@ def do_send_report(text, pre_ms, paste_s, send_s, via_timer=False):
         log_message(prefix + "❌ Не вдалося вставити/відправити.")
 
 def schedule_thread():
+    """Фоновий цикл таймера: коли час настав і таймер активний — відправляємо доповідь AUTOMATIC."""
     global next_report_time, timer_active
     with state_lock:
         timer_active = True
+        if next_report_time is None:
+            next_report_time = get_next_slot()  # ініціалізація, якщо ще не було
     log_message("✅ Таймер запущено.")
     while True:
         with state_lock:
@@ -330,16 +333,26 @@ def schedule_thread():
         if not active:
             break
         now = datetime.now()
+
         if now >= target:
+            log_message("⏰ ТАЙМЕР: час для доповіді — відправляю автоматично.")
+            # читаємо GUI-параметри в головному треді → пускаємо воркер (щоб було як кнопкою)
             def read_and_dispatch():
                 t = entry.get()
                 pre = pre_paste_delay.get()
                 pd = paste_delay.get()
                 sd = send_delay.get()
-                threading.Thread(target=do_send_report, args=(t, pre, pd, sd, True), daemon=True).start()
+                threading.Thread(
+                    target=do_send_report,
+                    args=(t, pre, pd, sd, True),
+                    daemon=True
+                ).start()
             root.after(0, read_and_dispatch)
+
+            # Плануємо наступний слот відразу після тригеру
             with state_lock:
                 next_report_time = get_next_slot(now + timedelta(seconds=1))
+
         time.sleep(0.2)
 
 # ================== GUI ==================
@@ -388,6 +401,10 @@ def start_timer():
             log_message("⚠️ Таймер уже працює.")
             return
         timer_active = True
+        # ВАЖЛИВО: не чіпаємо next_report_time тут, якщо він уже показується на лейблі
+        if next_report_time is None:
+            # якщо ще не ініціалізовано — виставимо прямо зараз
+            globals()['next_report_time'] = get_next_slot()
     threading.Thread(target=schedule_thread, daemon=True).start()
 
 def stop_timer():
