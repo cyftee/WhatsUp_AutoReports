@@ -19,6 +19,9 @@ CONFIG_FILE = "report.ini"
 CONFIG_SECTION = "Report"
 CONFIG_KEY = "text"
 
+# Антифлуд: 15 хв (у секундах)
+ANTIFLOOD_SECONDS = 15 * 60  # 900s
+
 # Опційні бібліотеки
 PYAUTOGUI_AVAILABLE = False
 PYPERCLIP_AVAILABLE = False
@@ -56,7 +59,13 @@ except Exception:
 # ================== ГЛОБАЛЬНИЙ СТАН ==================
 state_lock = threading.Lock()
 timer_active = False
-next_report_time = None
+next_report_time = None           # план наступного запуску (лише таймер-тред змінює)
+last_fired_target = None          # для якого target уже стріляли
+last_send_ts = 0.0                # антифлуд: штамп останньої відправки (секунди)
+
+# єдиний таймер-тред + замок на миттєве спрацювання
+timer_thread = None
+fire_lock = threading.Lock()
 
 log_q = queue.Queue()
 def log_message(msg: str):
@@ -78,7 +87,10 @@ def save_text(text):
         cfg.write(f)
 
 def get_next_slot(base=None):
-    """Найближча 45-та хвилина поточної/наступної години з випадковим офсетом -2..+2 хв."""
+    """
+    Найближча 45-та хвилина поточної/наступної години з випадковим офсетом -2..+2 хв.
+    Використовуємо для первинного планування та для планування від довільної бази.
+    """
     now = base or datetime.now()
     if now.minute < 45:
         t = now.replace(minute=45, second=0, microsecond=0)
@@ -86,6 +98,14 @@ def get_next_slot(base=None):
         t = (now + timedelta(hours=1)).replace(minute=45, second=0, microsecond=0)
     offset = random.randint(-2, 2)
     return t + timedelta(minutes=offset)
+
+def get_next_hour_slot_from_target(prev_target):
+    """
+    Планує наступний запуск ВІД попередньої цілі + 1 година, а не від 'тепер'.
+    Це усуває дублювання в межах тієї ж години.
+    """
+    base = (prev_target + timedelta(hours=1))
+    return get_next_slot(base)
 
 # ================== WHATSAPP: ПОШУК/ФОКУС/ВСТАВКА ==================
 def _pywinauto_find_main():
@@ -136,7 +156,7 @@ def _pywinauto_find_main():
     return None
 
 def _pywinauto_focus_and_type(text: str, do_send: bool) -> bool:
-    """Фокус вікна, пошук поля вводу (Edit) і друк напряму. Пробіли замінені на {SPACE}."""
+    """Фокус вікна, пошук поля вводу (Edit) і друк напряму. Пробіли -> {SPACE}."""
     found = _pywinauto_find_main()
     if not found:
         return False
@@ -149,7 +169,7 @@ def _pywinauto_focus_and_type(text: str, do_send: bool) -> bool:
         win.set_focus()
         time.sleep(0.15)
 
-        # Знайти всі Edit усередині (найнижче — композер)
+        # Знайти всі Edit (найнижчий — композер)
         try:
             edits = win.descendants(control_type="Edit")
         except Exception:
@@ -190,7 +210,6 @@ def _pywinauto_focus_and_type(text: str, do_send: bool) -> bool:
             pass
         time.sleep(0.1)
 
-        # --- КЛЮЧ: пробіли як {SPACE}
         safe_text = text.replace(" ", "{SPACE}")
         send_keys(safe_text, with_newlines=True, pause=0.01)
         time.sleep(0.05)
@@ -306,6 +325,16 @@ def whatsapp_send(text: str, do_send=True, pre_ms=300, paste_delay_s=0.5, send_d
 
 # ================== ВІДПРАВКА/ТАЙМЕР ==================
 def do_send_report(text, pre_ms, paste_s, send_s, via_timer=False):
+    # антифлуд: 15 хв
+    global last_send_ts
+    now_ts = time.time()
+    with state_lock:
+        if now_ts - last_send_ts < ANTIFLOOD_SECONDS:
+            left = int(ANTIFLOOD_SECONDS - (now_ts - last_send_ts))
+            log_message(f"⛔ Скасовано дубль: антифлуд {ANTIFLOOD_SECONDS//60} хв. Залишилось ~{left}с.")
+            return
+        last_send_ts = now_ts
+
     prefix = "⏰ [Таймер] " if via_timer else ""
     text = (text or "").strip()
     if not text:
@@ -319,39 +348,58 @@ def do_send_report(text, pre_ms, paste_s, send_s, via_timer=False):
         log_message(prefix + "❌ Не вдалося вставити/відправити.")
 
 def schedule_thread():
-    """Фоновий цикл таймера: коли час настав і таймер активний — відправляємо доповідь AUTOMATIC."""
-    global next_report_time, timer_active
+    """
+    Фоновий цикл таймера.
+    - Планування next_report_time робиться тільки тут.
+    - На один target — лише ОДНЕ відправлення (fire_lock + last_fired_target).
+    - Після спрацювання наступний target = get_next_slot(prev_target + 1 година).
+    """
+    global next_report_time, timer_active, last_fired_target
     with state_lock:
         timer_active = True
         if next_report_time is None:
-            next_report_time = get_next_slot()  # ініціалізація, якщо ще не було
+            next_report_time = get_next_slot()  # первинна ініціалізація
     log_message("✅ Таймер запущено.")
+
     while True:
         with state_lock:
             active = timer_active
             target = next_report_time
+            fired_for_target = (last_fired_target == target)
         if not active:
             break
+
         now = datetime.now()
+        if now >= target and not fired_for_target:
+            # атомарний захист від одночасних спрацювань
+            if not fire_lock.acquire(blocking=False):
+                time.sleep(0.1)
+                continue
+            try:
+                log_message(f"⏰ ТАЙМЕР: {target.strftime('%H:%M:%S')} — відправляю автоматично.")
+                with state_lock:
+                    last_fired_target = target  # позначаємо, що цей target уже обробляється
 
-        if now >= target:
-            log_message("⏰ ТАЙМЕР: час для доповіді — відправляю автоматично.")
-            # читаємо GUI-параметри в головному треді → пускаємо воркер (щоб було як кнопкою)
-            def read_and_dispatch():
-                t = entry.get()
-                pre = pre_paste_delay.get()
-                pd = paste_delay.get()
-                sd = send_delay.get()
-                threading.Thread(
-                    target=do_send_report,
-                    args=(t, pre, pd, sd, True),
-                    daemon=True
-                ).start()
-            root.after(0, read_and_dispatch)
+                # зчитуємо GUI-параметри в головному треді → воркер як кнопка
+                def read_and_dispatch():
+                    t = entry.get()
+                    pre = pre_paste_delay.get()
+                    pd = paste_delay.get()
+                    sd = send_delay.get()
+                    threading.Thread(
+                        target=do_send_report,
+                        args=(t, pre, pd, sd, True),
+                        daemon=True
+                    ).start()
+                root.after(0, read_and_dispatch)
 
-            # Плануємо наступний слот відразу після тригеру
-            with state_lock:
-                next_report_time = get_next_slot(now + timedelta(seconds=1))
+                # одразу плануємо наступний target ВІД поточного target + 1 година
+                with state_lock:
+                    next_report_time = get_next_hour_slot_from_target(target)
+                    log_message(f"📅 Наступна доповідь запланована на {next_report_time.strftime('%H:%M:%S')}")
+
+            finally:
+                fire_lock.release()
 
         time.sleep(0.2)
 
@@ -395,17 +443,18 @@ timer_frame.pack(pady=15, padx=20, fill=tk.X)
 
 btns = tk.Frame(timer_frame); btns.pack(pady=10)
 def start_timer():
-    global timer_active
+    global timer_active, timer_thread
     with state_lock:
-        if timer_active:
-            log_message("⚠️ Таймер уже працює.")
+        # не даємо стартувати другому треду
+        if timer_active and timer_thread and timer_thread.is_alive():
+            log_message("⚠️ Таймер уже працює (активний тред).")
             return
         timer_active = True
-        # ВАЖЛИВО: не чіпаємо next_report_time тут, якщо він уже показується на лейблі
         if next_report_time is None:
-            # якщо ще не ініціалізовано — виставимо прямо зараз
             globals()['next_report_time'] = get_next_slot()
-    threading.Thread(target=schedule_thread, daemon=True).start()
+    timer_thread = threading.Thread(target=schedule_thread, daemon=True)
+    timer_thread.start()
+    log_message("▶️ Запуск таймера…")
 
 def stop_timer():
     global timer_active
@@ -479,30 +528,25 @@ def pump_logs():
         pass
     root.after(50, pump_logs)
 
-# --- таймерний лейбл: завжди показуємо
-def ensure_next_time():
-    global next_report_time
+# --- таймерний лейбл: лише показує (НЕ змінює next_report_time)
+def compute_display_target():
     with state_lock:
-        if next_report_time is None:
-            next_report_time = get_next_slot()
-        # якщо час минув, а таймер вимкнено — просто пересунути показ на наступний слот
-        if datetime.now() >= next_report_time and not timer_active:
-            next_report_time = get_next_slot(datetime.now() + timedelta(seconds=1))
+        target = next_report_time
+    if target is not None:
+        return target
+    return get_next_slot()
 
 def update_timer_label():
-    ensure_next_time()
-    with state_lock:
-        active = timer_active
-        target = next_report_time
+    target = compute_display_target()
     now = datetime.now()
     remaining = target - now
     if remaining.total_seconds() < 0:
-        with state_lock:
-            globals()['next_report_time'] = get_next_slot(now + timedelta(seconds=1))
-        target = next_report_time
+        target = get_next_slot(now + timedelta(seconds=1))
         remaining = target - now
     mins, secs = divmod(int(remaining.total_seconds()), 60)
     hours, mins = divmod(mins, 60)
+    with state_lock:
+        active = timer_active
     status = "🟢 Таймер активний" if active else "⚪ Таймер вимкнений"
     timer_label.config(
         text=f"{status}\nНаступна доповідь: {target.strftime('%H:%M:%S')}\nЗалишилось: {hours:02d}:{mins:02d}:{secs:02d}"
@@ -513,10 +557,8 @@ def update_timer_label():
 root.title(APP_TITLE)
 log_message("🚀 Запуск. Рекомендовано: pip install pywinauto psutil")
 
-# ініціалізуємо next_report_time, щоб лейбл показував одразу
-with state_lock:
-    next_report_time = get_next_slot()
-
+# не плануємо нічого тут — планування робить лише таймер-тред;
+# лейбл сам рахує відображення
 root.after(0, pump_logs)
 root.after(0, update_timer_label)
 root.mainloop()
