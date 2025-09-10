@@ -10,8 +10,8 @@ import os
 import queue
 import ctypes
 import ctypes.wintypes as wt
+import traceback
 
-# ================== НАЛАШТУВАННЯ/КОНСТАНТИ ==================
 APP_TITLE = "АвтоДоповідь WhatsApp — стабільна"
 SELF_PID = os.getpid()
 
@@ -19,10 +19,10 @@ CONFIG_FILE = "report.ini"
 CONFIG_SECTION = "Report"
 CONFIG_KEY = "text"
 
-# Антифлуд: 15 хв (у секундах)
-ANTIFLOOD_SECONDS = 15 * 60  # 900s
+ANTIFLOOD_SECONDS = 15 * 60  # 15 хв
+VERIFY_BEFORE_SEND = True
+VERIFY_RETRIES = 3
 
-# Опційні бібліотеки
 PYAUTOGUI_AVAILABLE = False
 PYPERCLIP_AVAILABLE = False
 PYWINAUTO_AVAILABLE = False
@@ -56,14 +56,72 @@ try:
 except Exception:
     PSUTIL_AVAILABLE = False
 
-# ================== ГЛОБАЛЬНИЙ СТАН ==================
+# ---------------------- WinAPI helpers ----------------------
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+GetWindowTextW = user32.GetWindowTextW
+GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+GetWindowTextW.restype = ctypes.c_int
+
+IsWindowVisible = user32.IsWindowVisible
+GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+GetWindowRect = user32.GetWindowRect
+SetForegroundWindow = user32.SetForegroundWindow
+ShowWindow = user32.ShowWindow
+
+SW_RESTORE = 9
+
+def get_window_title(hwnd):
+    buf = ctypes.create_unicode_buffer(512)
+    GetWindowTextW(hwnd, buf, 512)
+    return buf.value.strip()
+
+def get_window_pid(hwnd):
+    pid = wt.DWORD()
+    GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+def is_window_visible(hwnd):
+    return bool(IsWindowVisible(hwnd))
+
+def enum_visible_top_windows():
+    result = []
+    def callback(hwnd, lParam):
+        try:
+            if not is_window_visible(hwnd):
+                return True
+            title = get_window_title(hwnd)
+            if not title:
+                return True
+            result.append(hwnd)
+        except Exception:
+            pass
+        return True
+    user32.EnumWindows(EnumWindowsProc(callback), 0)
+    return result
+
+def get_window_rect(hwnd):
+    rect = wt.RECT()
+    GetWindowRect(hwnd, ctypes.byref(rect))
+    return rect
+
+def restore_and_foreground(hwnd):
+    try:
+        ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.1)
+        SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+# ---------------------- Глобальний стан ----------------------
 state_lock = threading.Lock()
 timer_active = False
-next_report_time = None           # план наступного запуску (лише таймер-тред змінює)
-last_fired_target = None          # для якого target уже стріляли
-last_send_ts = 0.0                # антифлуд: штамп останньої відправки (секунди)
-
-# єдиний таймер-тред + замок на миттєве спрацювання
+next_report_time = None
+last_fired_target = None
+last_send_ts = 0.0
 timer_thread = None
 fire_lock = threading.Lock()
 
@@ -72,7 +130,12 @@ def log_message(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     log_q.put(f"[{ts}] {msg}\n")
 
-# ================== УТИЛІТИ ==================
+def log_exception(prefix: str, e: Exception):
+    tb = traceback.format_exc(limit=2)
+    log_message(f"{prefix}: {e.__class__.__name__}: {e}")
+    log_message(f"↳ Trace: {tb.strip()}")
+
+# ---------------------- Утиліти часу ----------------------
 def load_saved_text():
     cfg = configparser.ConfigParser()
     if os.path.exists(CONFIG_FILE):
@@ -87,10 +150,6 @@ def save_text(text):
         cfg.write(f)
 
 def get_next_slot(base=None):
-    """
-    Найближча 45-та хвилина поточної/наступної години з випадковим офсетом -2..+2 хв.
-    Використовується для первинного планування від "зараз".
-    """
     now = base or datetime.now()
     if now.minute < 45:
         t = now.replace(minute=45, second=0, microsecond=0)
@@ -100,234 +159,255 @@ def get_next_slot(base=None):
     return t + timedelta(minutes=offset)
 
 def get_next_hour_slot_from_target(prev_target):
-    """
-    ✅ ФІКС: плануємо наступний запуск ВІД попередньої цілі + 1 година РІВНО на :45
-    (+ випадковий офсет -2..+2 хв), без переходу ще на одну годину.
-    Напр., було 10:45 → стане 11:45±офсет.
-    """
     base = (prev_target + timedelta(hours=1)).replace(minute=45, second=0, microsecond=0)
     offset = random.randint(-2, 2)
     return base + timedelta(minutes=offset)
 
-# ================== WHATSAPP: ПОШУК/ФОКУС/ВСТАВКА ==================
-def _pywinauto_find_main():
-    """Знаходимо головне вікно WhatsApp через UIA і відсікаємо наше Tk-вікно."""
-    if not PYWINAUTO_AVAILABLE:
-        return None
-    try:
-        handles = findwindows.find_windows(title_re=r".*WhatsApp.*", visible_only=True)
-        for h in handles:
-            app = Application(backend="uia").connect(handle=h, timeout=5)
-            dlg = app.window(handle=h)
-            if not (dlg.exists() and dlg.is_visible()):
-                continue
+# ---------------------- Пошук вікна WhatsApp ----------------------
+BROWSER_NAMES = ("chrome", "msedge", "firefox", "opera", "opera_gx", "vivaldi", "brave")
 
-            # Відсікаємо наше вікно за PID/класом/титулом
-            try:
-                pid = dlg.element_info.process_id
-            except Exception:
-                pid = None
-            try:
-                cls = dlg.element_info.class_name or ""
-            except Exception:
-                cls = ""
-            try:
-                title = dlg.window_text() or ""
-            except Exception:
-                title = ""
+def list_candidate_pids():
+    """PIDs для WhatsApp Desktop + браузери."""
+    pids_whatsapp = set()
+    pids_browsers = set()
+    if not PSUTIL_AVAILABLE:
+        return pids_whatsapp, pids_browsers
 
-            if pid == SELF_PID:
-                continue
-            if "TkTopLevel" in cls:
-                continue
-            if APP_TITLE and APP_TITLE in title:
-                continue
+    for p in psutil.process_iter(['pid', 'name']):
+        name = (p.info.get('name') or "").lower()
+        if "whatsapp" in name:
+            pids_whatsapp.add(p.info['pid'])
+        elif any(b in name for b in BROWSER_NAMES):
+            pids_browsers.add(p.info['pid'])
+    return pids_whatsapp, pids_browsers
 
-            # Опціонально — перевіряємо ім'я процесу
-            if PSUTIL_AVAILABLE and pid:
-                try:
-                    name = psutil.Process(pid).name()
-                    if "whatsapp" not in name.lower():
-                        continue
-                except Exception:
-                    pass
+def find_whatsapp_window():
+    """
+    Повертає кортеж (hwnd, origin) де origin ∈ {"desktop","web","unknown"} або (None, None).
+    Спочатку шукаємо вікна процесів WhatsApp, далі — браузери з title, що містить "WhatsApp".
+    Відсікаємо наше Tk-вікно за SELF_PID та APP_TITLE.
+    """
+    hwnds = enum_visible_top_windows()
+    pids_whatsapp, pids_browsers = list_candidate_pids()
+    desktop_best = None
+    web_best = None
 
-            return app, dlg
-    except Exception as e:
-        log_message(f"pywinauto пошук: {e}")
-    return None
-
-def _pywinauto_focus_and_type(text: str, do_send: bool) -> bool:
-    """Фокус вікна, пошук поля вводу (Edit) і друк напряму. Пробіли -> {SPACE}."""
-    found = _pywinauto_find_main()
-    if not found:
-        return False
-    app, win = found
-    try:
+    for hwnd in hwnds:
         try:
-            win.restore()
-        except Exception:
-            pass
-        win.set_focus()
-        time.sleep(0.15)
+            pid = get_window_pid(hwnd)
+            title = get_window_title(hwnd)
+            if not title:
+                continue
+            # відсікаємо наше вікно
+            if pid == SELF_PID or (APP_TITLE and APP_TITLE in title):
+                continue
 
-        # Знайти всі Edit (найнижчий — композер)
+            # 1) WhatsApp Desktop по PID процесу
+            if pid in pids_whatsapp:
+                desktop_best = hwnd
+                # якщо в заголовку є "WhatsApp" — це майже те, що треба
+                if "whatsapp" in title.lower():
+                    return hwnd, "desktop"
+                continue
+
+            # 2) WhatsApp Web у браузері: браузерний PID + title містить 'WhatsApp'
+            if pid in pids_browsers and ("whatsapp" in title.lower() or "web.whatsapp" in title.lower()):
+                if web_best is None:
+                    web_best = hwnd
+        except Exception:
+            continue
+
+    if desktop_best:
+        return desktop_best, "desktop"
+    if web_best:
+        return web_best, "web"
+    # як останній шанс: будь-яке видиме вікно з 'WhatsApp' у заголовку
+    for hwnd in hwnds:
+        title = get_window_title(hwnd)
+        pid = get_window_pid(hwnd)
+        if pid == SELF_PID:
+            continue
+        if "whatsapp" in title.lower():
+            return hwnd, "unknown"
+    return None, None
+
+# ---------------------- Вставка у WhatsApp ----------------------
+def _uia_set_focus_and_type(text: str, do_send: bool) -> bool:
+    if not PYWINAUTO_AVAILABLE:
+        return False
+    hwnd, origin = find_whatsapp_window()
+    if not hwnd:
+        log_message("UIA: не знайдено вікна WhatsApp.")
+        return False
+    try:
+        restore_and_foreground(hwnd)
+        app = Application(backend="uia").connect(handle=hwnd, timeout=5)
+        win = app.window(handle=hwnd)
         try:
             edits = win.descendants(control_type="Edit")
         except Exception:
             edits = []
-
         if not edits:
-            # запасний варіант: клік у нижню частину + send_keys
-            rect = win.rectangle()
-            cx = rect.left + rect.width() // 2
-            cy = rect.bottom - 60
-            if PYAUTOGUI_AVAILABLE:
-                pyautogui.click(cx, cy)
-                time.sleep(0.1)
-                safe_text = text.replace(" ", "{SPACE}")
-                send_keys(safe_text, with_newlines=True, pause=0.01)
-                if do_send:
-                    send_keys("{ENTER}")
-                return True
+            log_message("UIA: не знайдено поле вводу (Edit).")
             return False
 
-        def bottom_y(ed):
-            try:
-                r = ed.rectangle()
-                return r.bottom
-            except Exception:
-                return -1
-
-        edits.sort(key=bottom_y, reverse=True)
+        # беремо найнижче поле
+        try:
+            edits.sort(key=lambda ed: ed.rectangle().bottom, reverse=True)
+        except Exception:
+            pass
         edit = edits[0]
-
-        try:
-            edit.set_focus()
-        except Exception:
-            pass
-        try:
-            edit.click_input()
-        except Exception:
-            pass
-        time.sleep(0.1)
+        try: edit.set_focus()
+        except Exception: pass
+        try: edit.click_input()
+        except Exception: pass
+        time.sleep(0.08)
 
         safe_text = text.replace(" ", "{SPACE}")
+        log_message("UIA: друкую текст (send_keys)…")
         send_keys(safe_text, with_newlines=True, pause=0.01)
-        time.sleep(0.05)
+
+        if VERIFY_BEFORE_SEND:
+            if not _verify_via_clipboard(text):
+                log_message("UIA: верифікація не пройшла (текст у полі не збігся).")
+                return False
         if do_send:
             send_keys("{ENTER}")
-            time.sleep(0.05)
         return True
     except Exception as e:
-        log_message(f"pywinauto друк: {e}")
+        log_exception("UIA: помилка друку", e)
         return False
 
-# --- ctypes, щоб дістати PID з HWND (без win32api)
-def _get_pid_from_hwnd(hwnd: int) -> int:
-    user32 = ctypes.windll.user32
-    pid = wt.DWORD()
-    user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
-    return pid.value
-
-def _pyautogui_activate_win():
-    """Шукаємо вікно WhatsApp через pyautogui, ігноруємо наше Tk-вікно/заголовок."""
-    if not PYAUTOGUI_AVAILABLE:
-        return None
-    titles = ["WhatsApp Desktop", "WhatsApp", "WhatsApp Web", "WhatsApp Business"]
-    for t in titles:
-        try:
-            wins = pyautogui.getWindowsWithTitle(t)
-        except Exception:
-            wins = []
-        for w in wins:
-            if not w:
-                continue
-            title = (w.title or "")
-            # фільтр нашого вікна
-            if APP_TITLE and APP_TITLE in title:
-                continue
-            if "Tk" in title and "TopLevel" in title:
-                continue
-            # PID/процес
-            try:
-                hwnd = int(getattr(w, "_hWnd", 0))
-            except Exception:
-                hwnd = 0
-            if hwnd:
-                try:
-                    pid = _get_pid_from_hwnd(hwnd)
-                    if pid == SELF_PID:
-                        continue
-                    if PSUTIL_AVAILABLE:
-                        pname = psutil.Process(pid).name()
-                        if "whatsapp" not in pname.lower():
-                            continue
-                except Exception:
-                    pass
-            return w
-    return None
-
-def _pyautogui_paste(text: str, do_send: bool, pre_ms: int, paste_delay_s: float, send_delay_s: float) -> bool:
-    """Fallback: активуємо вікно, клікаємо в композер, Ctrl+V, Enter."""
-    w = _pyautogui_activate_win()
-    if not w:
+def _uia_focus_and_paste(text: str, do_send: bool, pre_ms: int, paste_delay_s: float) -> bool:
+    if not (PYWINAUTO_AVAILABLE and PYAUTOGUI_AVAILABLE and PYPERCLIP_AVAILABLE):
+        return False
+    hwnd, origin = find_whatsapp_window()
+    if not hwnd:
+        log_message("UIA+Paste: не знайдено вікна WhatsApp.")
         return False
     try:
-        if w.isMinimized:
-            w.restore()
-            time.sleep(0.3)
-        for _ in range(3):
-            w.activate()
-            time.sleep(0.2)
-            aw = None
-            try:
-                aw = pyautogui.getActiveWindow()
-            except Exception:
-                pass
-            if aw and "WhatsApp" in (aw.title or ""):
-                break
-            pyautogui.click(w.left + 80, w.top + 10)  # титулбар
-            time.sleep(0.15)
+        restore_and_foreground(hwnd)
+        app = Application(backend="uia").connect(handle=hwnd, timeout=5)
+        win = app.window(handle=hwnd)
+        try:
+            edits = win.descendants(control_type="Edit")
+        except Exception:
+            edits = []
+        if not edits:
+            log_message("UIA+Paste: не знайдено поле вводу (Edit).")
+            return False
 
-        # клік у нижню середину (композер)
+        try:
+            edits.sort(key=lambda ed: ed.rectangle().bottom, reverse=True)
+        except Exception:
+            pass
+        edit = edits[0]
+        try: edit.set_focus()
+        except Exception: pass
+        try: edit.click_input()
+        except Exception: pass
+
+        time.sleep(max(0.05, pre_ms/1000.0))
+        pyperclip.copy(text)
+        time.sleep(0.12)
+        log_message("UIA+Paste: Ctrl+V…")
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(max(0.05, paste_delay_s))
+
+        if VERIFY_BEFORE_SEND:
+            if not _verify_via_clipboard(text):
+                log_message("UIA+Paste: верифікація не пройшла (текст у полі не збігся).")
+                return False
+        if do_send:
+            send_keys("{ENTER}")
+        return True
+    except Exception as e:
+        log_exception("UIA+Paste: помилка вставки", e)
+        return False
+
+def _pgui_click_and_paste(text: str, do_send: bool, pre_ms: int, paste_delay_s: float, send_delay_s: float) -> bool:
+    if not (PYAUTOGUI_AVAILABLE and PYPERCLIP_AVAILABLE):
+        return False
+    hwnd, origin = find_whatsapp_window()
+    if not hwnd:
+        log_message("PyAutoGUI: не знайдено вікна WhatsApp.")
+        return False
+    try:
+        restore_and_foreground(hwnd)
+        rect = get_window_rect(hwnd)
+        # Клік у нижню частину (поле вводу)
+        cx = rect.left + (rect.right - rect.left)//2
+        cy = rect.bottom - 60
         pyautogui.press('esc')
         time.sleep(0.05)
-        cx = w.left + w.width // 2
-        cy = w.top + w.height - 60
         pyautogui.click(cx, cy)
         time.sleep(max(0.0, pre_ms/1000.0))
 
-        if not PYPERCLIP_AVAILABLE:
-            return False
         pyperclip.copy(text)
-        time.sleep(0.15)
+        time.sleep(0.12)
+        log_message("PyAutoGUI: Ctrl+V…")
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(max(0.05, paste_delay_s))
+
+        if VERIFY_BEFORE_SEND:
+            if not _verify_via_clipboard(text):
+                log_message("PyAutoGUI: верифікація не пройшла (текст у полі не збігся).")
+                pyautogui.press('end')
+                return False
+            pyautogui.press('end')
+
         if do_send:
             pyautogui.press('enter')
             time.sleep(max(0.05, send_delay_s))
         return True
     except Exception as e:
-        log_message(f"pyautogui вставка: {e}")
+        log_exception("PyAutoGUI: помилка вставки", e)
+        return False
+
+def _verify_via_clipboard(expected: str) -> bool:
+    """Ctrl+A → Ctrl+C → порівняння з expected; повертаємо курсор у кінець."""
+    try:
+        if PYAUTOGUI_AVAILABLE:
+            pyautogui.hotkey('ctrl', 'a'); time.sleep(0.05)
+            pyautogui.hotkey('ctrl', 'c'); time.sleep(0.08)
+            if PYPERCLIP_AVAILABLE:
+                got = pyperclip.paste()
+                ok = (got == expected)
+            else:
+                ok = False
+            pyautogui.press('end')
+            return ok
+        else:
+            # UIA клавіатурою
+            send_keys("^a"); time.sleep(0.05)
+            send_keys("^c"); time.sleep(0.08)
+            got = pyperclip.paste() if PYPERCLIP_AVAILABLE else None
+            send_keys("{END}")
+            return got == expected
+    except Exception as e:
+        log_exception("Верифікація", e)
         return False
 
 def whatsapp_send(text: str, do_send=True, pre_ms=300, paste_delay_s=0.5, send_delay_s=0.3) -> bool:
-    """UIA-друк (з {SPACE}) → fallback Ctrl+V. 3 спроби."""
-    for attempt in range(1, 4):
-        if PYWINAUTO_AVAILABLE and _pywinauto_focus_and_type(text, do_send):
-            log_message(f"✅ Вставка через UIA (спроба {attempt})")
-            return True
-        ok = _pyautogui_paste(text, do_send, pre_ms, paste_delay_s, send_delay_s)
-        if ok:
-            log_message(f"✅ Вставка через Ctrl+V (спроба {attempt})")
-            return True
-        time.sleep(0.2 * attempt)
+    methods = [
+        ("UIA: друк", lambda: _uia_set_focus_and_type(text, do_send)),
+        ("UIA: Ctrl+V", lambda: _uia_focus_and_paste(text, do_send, pre_ms, paste_delay_s)),
+        ("PyAutoGUI: Ctrl+V", lambda: _pgui_click_and_paste(text, do_send, pre_ms, paste_delay_s, send_delay_s)),
+    ]
+    for name, fn in methods:
+        for attempt in range(1, VERIFY_RETRIES + 1):
+            log_message(f"→ Спроба [{name}] #{attempt}…")
+            ok = fn()
+            if ok:
+                log_message(f"✅ Успіх методом [{name}]")
+                return True
+            else:
+                log_message(f"⚠️ [{name}] не вдалась (спроба {attempt}).")
+                time.sleep(0.25 * attempt)
     return False
 
-# ================== ВІДПРАВКА/ТАЙМЕР ==================
+# ---------------------- Відправка/таймер ----------------------
 def do_send_report(text, pre_ms, paste_s, send_s, via_timer=False):
-    # антифлуд: 15 хв
     global last_send_ts
     now_ts = time.time()
     with state_lock:
@@ -350,17 +430,11 @@ def do_send_report(text, pre_ms, paste_s, send_s, via_timer=False):
         log_message(prefix + "❌ Не вдалося вставити/відправити.")
 
 def schedule_thread():
-    """
-    Фоновий цикл таймера.
-    - Планування next_report_time робиться тільки тут.
-    - На один target — лише ОДНЕ відправлення (fire_lock + last_fired_target).
-    - Після спрацювання наступний target = (prev_target + 1 година) @ :45 ± офсет.
-    """
     global next_report_time, timer_active, last_fired_target
     with state_lock:
         timer_active = True
         if next_report_time is None:
-            next_report_time = get_next_slot()  # первинна іниціалізація від "зараз"
+            next_report_time = get_next_slot()
     log_message("✅ Таймер запущено.")
 
     while True:
@@ -373,16 +447,13 @@ def schedule_thread():
 
         now = datetime.now()
         if now >= target and not fired_for_target:
-            # атомарний захист від одночасних спрацювань
             if not fire_lock.acquire(blocking=False):
                 time.sleep(0.1)
                 continue
             try:
                 log_message(f"⏰ ТАЙМЕР: {target.strftime('%H:%M:%S')} — відправляю автоматично.")
                 with state_lock:
-                    last_fired_target = target  # позначаємо, що цей target уже обробляється
-
-                # зчитуємо GUI-параметри в головному треді → воркер як кнопка
+                    last_fired_target = target
                 def read_and_dispatch():
                     t = entry.get()
                     pre = pre_paste_delay.get()
@@ -394,21 +465,17 @@ def schedule_thread():
                         daemon=True
                     ).start()
                 root.after(0, read_and_dispatch)
-
-                # ✅ плануємо наступний target ВІД поточного target + 1 година (без пропуску ще однієї)
                 with state_lock:
                     next_report_time = get_next_hour_slot_from_target(target)
                     log_message(f"📅 Наступна доповідь запланована на {next_report_time.strftime('%H:%M:%S')}")
-
             finally:
                 fire_lock.release()
-
         time.sleep(0.2)
 
-# ================== GUI ==================
+# ---------------------- GUI ----------------------
 root = tk.Tk()
 root.title(APP_TITLE)
-root.geometry("920x720")
+root.geometry("940x760")
 
 paste_delay = tk.DoubleVar(value=0.8)
 send_delay = tk.DoubleVar(value=0.3)
@@ -447,7 +514,6 @@ btns = tk.Frame(timer_frame); btns.pack(pady=10)
 def start_timer():
     global timer_active, timer_thread
     with state_lock:
-        # не даємо стартувати другому треду
         if timer_active and timer_thread and timer_thread.is_alive():
             log_message("⚠️ Таймер уже працює (активний тред).")
             return
@@ -500,12 +566,22 @@ def diagnose():
     log_message(f"  pyperclip: {PYPERCLIP_AVAILABLE}")
     log_message(f"  psutil: {PSUTIL_AVAILABLE}")
 
+    # Виведемо кандидатні вікна
+    hwnd, origin = find_whatsapp_window()
+    if hwnd:
+        title = get_window_title(hwnd)
+        pid = get_window_pid(hwnd)
+        rect = get_window_rect(hwnd)
+        log_message(f"  Знайдено WhatsApp ({origin}) HWND={hwnd} PID={pid} TITLE='{title}' "
+                    f"RECT=({rect.left},{rect.top},{rect.right},{rect.bottom})")
+    else:
+        log_message("  WhatsApp-вікно не знайдено. Відкрий WhatsApp Desktop або вкладку web.whatsapp у браузері.")
+
 row = tk.Frame(actions); row.pack(pady=10)
 tk.Button(row, text="Відправити зараз", command=send_now, font=("Arial", 9), bg="#2196F3", fg="white", width=17).pack(side=tk.LEFT, padx=3)
 tk.Button(row, text="Тест вставлення", command=test_insert, font=("Arial", 9), bg="#FF9800", fg="white", width=17).pack(side=tk.LEFT, padx=3)
 tk.Button(row, text="Діагностика", command=diagnose, font=("Arial", 9), bg="#9C27B0", fg="white", width=17).pack(side=tk.LEFT, padx=3)
 
-# вкладка логів
 log_tab = ttk.Frame(notebook); notebook.add(log_tab, text="Логи")
 log_header = tk.Frame(log_tab); log_header.pack(fill=tk.X, padx=10, pady=5)
 tk.Label(log_header, text="Логи:", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
@@ -519,7 +595,6 @@ log_text.config(yscrollcommand=log_scroll.set)
 log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10,0), pady=10)
 log_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0,10), pady=10)
 
-# --- лог-помпа
 def pump_logs():
     try:
         while True:
@@ -530,7 +605,6 @@ def pump_logs():
         pass
     root.after(50, pump_logs)
 
-# --- таймерний лейбл: лише показує (НЕ змінює next_report_time)
 def compute_display_target():
     with state_lock:
         target = next_report_time
@@ -555,12 +629,9 @@ def update_timer_label():
     )
     root.after(200, update_timer_label)
 
-# ================== СТАРТ ==================
 root.title(APP_TITLE)
 log_message("🚀 Запуск. Рекомендовано: pip install pywinauto psutil")
 
-# не плануємо нічого тут — планування робить лише таймер-тред;
-# лейбл сам рахує відображення
 root.after(0, pump_logs)
 root.after(0, update_timer_label)
 root.mainloop()
